@@ -1,105 +1,63 @@
 # PricePilot
 
-**PricePilot** is an automated price monitoring and notification tool, primarily written in Python. It is designed to track product prices on e-commerce sites, detect price changes and discounts, and send alerts (for example, via Discord webhooks). The project is easily extensible for new shops and supports multi-currency price tracking.
+Scheduled GitHub Actions monitor that scans an ASOS Sweden category and posts
+likely **price errors** to Discord. Built to send few alerts, almost all real.
 
-## Features
+## How a price error is detected
 
-- **Automated Price Monitoring:** Periodically checks prices for specified products from supported online retailers.
-- **Multi-Currency Support:** Fetches and caches foreign exchange rates to normalize prices (e.g., to SEK, EUR, USD, GBP).
-- **Shop Adapters:** Extensible adapter framework for scraping and parsing product listings and details from different shops (e.g., ASOS, sites with static HTML/CSS).
-- **Discount & Brand Filters:** Customizable filtering to alert only on specific brands or minimum discount thresholds.
-- **State Management:** Remembers seen products and price state to avoid duplicate alerts.
-- **Discord Notifications:** Sends rich, embeddable notifications to Discord channels via webhooks.
+ASOS sells the same product, with the same product id, in every store. Each run:
 
-## Getting Started
+1. scans the whole category in the Swedish store (about 20 requests for ~4,000 items),
+2. scans the same category in the reference stores (GB and DE),
+3. looks up by id the items a reference store sells but does not list in that
+   category, and caches the answer until the Swedish price changes,
+4. measures the normal SEK/GBP and SEK/EUR price ratio as the median over all
+   items in the run (no FX API involved),
+5. flags items whose Swedish price is at most `error_ratio` (50%) of what
+   **every** reference store implies and at least `min_saving` SEK below it,
+6. checks stock for the flagged items only, and drops the sold-out ones.
 
-### Requirements
+Real example: a Samba at 110 GBP in the UK was listed at 110 SEK in Sweden,
+0.07 of the expected ratio. The lowest normally priced item in the same scan
+was at 0.70, so the threshold has a lot of room on both sides.
 
-- Python 3.8+
-- Dependencies: `httpx`, `PyYAML`, `beautifulsoup4`, `lxml` (see `requirements.txt` if present)
+Requiring every reference store to agree means a wrong price in one of them
+cannot cause an alert. Items no reference store sells (5 of 4,100) are not judged.
 
-### Setup
+Sold-out and undelivered alerts are not marked as sent, so they are retried on
+later runs (a restock alerts). A failed or partial scan sends nothing and
+leaves `state/` untouched.
 
-1. **Clone the Repository**
-   ```sh
-   git clone https://github.com/Elieez/PricePilot-v2.git
-   cd PricePilot-v2
-   ```
+## Setup
 
-2. **Install Dependencies**
-   ```sh
-   pip install -r requirements.txt
-   ```
+1. Discord: channel → Edit Channel → Integrations → Webhooks → New Webhook → copy URL.
+2. GitHub: repo → Settings → Secrets and variables → Actions → New repository
+   secret, name `DISCORD_WEBHOOK`, value = the webhook URL.
+3. Actions tab → PricePilot Monitor → Run workflow.
 
-3. **Discord Webhook Setup**
+The schedule is in `.github/workflows/monitor.yml`. A blocked or failed scan
+fails the job, so it shows up red.
 
-   In Discord, open the text channel where you want alerts → Edit Channel → Integrations → Webhooks → New Webhook → copy the webhook URL.
-
-   **GitHub Actions secret (recommended):**  
-   Repo → Settings → Secrets and variables → Actions → New repository secret
-
-   - Name: `DISCORD_WEBHOOK`
-   - Value: (paste the webhook URL)
-
-   **Local runs (optional):** set it as an env var (avoid committing secrets):
-
-   **macOS/Linux:**
-   ```sh
-   export DISCORD_WEBHOOK="https://discord.com/api/webhooks/..."
-   ```
-
-   **Windows PowerShell:**
-   ```powershell
-   $env:DISCORD_WEBHOOK = "https://discord.com/api/webhooks/..."
-   ```
-
-4. **Configure Monitors**
-   - Edit or create a configuration file (YAML or JSON) specifying:
-     - The shops to monitor
-     - Webhook URLs
-     - Filters for brands, discounts, etc.
-
-5. **Run the Monitor**
-   ```sh
-   python monitor.py
-   ```
-
-## Usage
-
-- The main entry point is `monitor.py`, which loads configuration, periodically fetches product listings, and sends notifications if price drops or new discounts are detected.
-- Results are cached in the `state/` directory to avoid duplicate alerts and speed up repeated runs.
-
-## How deals are picked (`asos_api` monitors)
-
-Each run scans the whole category through the ASOS search API (about 20 requests for ~4,000 items) and compares every item with a reference price:
-
-1. its own price on the previous run (catches silent drops on existing products),
-2. the list price ASOS declares, if any,
-3. otherwise the median price of the same brand + product type, falling back to the product type scaled by how expensive the brand usually is.
-
-An item is alerted when it costs at most `deal_ratio` of that reference and saves at least `min_saving`. At `bug_ratio` or below it is flagged as a possible price error. Thresholds live under `scoring:` in `config.yaml`.
-
-Tune them without sending anything:
+## Local use
 
 ```sh
-python monitor.py --dry-run
+pip install -r requirements.txt
+python monitor.py --dry-run     # full scan (~3 min), prints what would be alerted, sends and saves nothing
+python monitor.py --from-dump   # re-scores that scan instantly after a config change
+python -m unittest discover tests
 ```
 
-Tests: `python -m unittest discover tests`
+A real local run needs `DISCORD_WEBHOOK` in the environment.
 
-## Extending
+## Configuration (`config.yaml`)
 
-- Add new shop support by creating an adapter in `adapters.py` that implements `discover_urls` (to find products) and `fetch_offer` (to extract price, brand, etc.).
-- Adjust notification logic or add new output channels as needed.
+- `category_id`: the ASOS category to scan. Add another monitor block (with its
+  own `slug`) to scan more categories.
+- `reference_stores`: stores to compare against.
+- `scoring`: `error_ratio`, `min_saving`, `max_alerts_per_run`.
+- `filters.exclude_brands`: brands never alerted.
 
-## Technologies Used
+## Being a polite client
 
-- **Python:** Main application language
-- **httpx:** For HTTP requests
-- **PyYAML:** For flexible config parsing
-- **BeautifulSoup & lxml:** HTML parsing
-- **Discord Webhooks:** For alert notifications
-
----
-
-*Repository: [Elieez/PricePilot-v2](https://github.com/Elieez/PricePilot-v2)*
+Requests identify themselves with an honest User-Agent, are paced with a pause
+between each one, and run one scan at a time. Do not change that.

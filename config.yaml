@@ -1,43 +1,34 @@
-discord_webhook: "${{ secrets.DISCORD_WEBHOOK }}"
-
-# Default output currency
-currency_output: SEK
-fx:
-  provider: exchangerate_host
-  refresh_hours: 24
-  symbols: [SEK, EUR, USD, GBP, DKK, NOK]
+# The Discord webhook comes from the DISCORD_WEBHOOK environment variable
+# (a repository secret in GitHub Actions). It is never stored in this file.
 
 run:
-  sample_limit_per_run: 30
-  jitter_ms: [800, 1600]
+  jitter_ms: [800, 1600]           # pause between requests to ASOS
 
-#Global filters (can overrider per monitor)
 filters:
-  include_brands: []
-  exclude_brands: ["new look", "pull&bear"]
-  require_discount_pct: 0
-  unique_by: "variant"
-  keep_query_params: ["colourWayId","clr"]
+  exclude_brands: []
 
 monitors:
-  # Scans the whole men's new-in category through the ASOS search API and alerts
-  # only on items priced far below what that brand + product type normally costs.
+  # Scans the whole men's new-in category in the Swedish store and compares every
+  # price with the same product in the reference stores. Alerts only when the
+  # Swedish price is far below what every reference store implies.
   - name: "ASOS (men, new in)"
     slug: "asos-men-new"
     adapter: "asos_api"
     category_id: 27110
-    type_facet: "attribute_1047"   # "Produkttyp"
     store: SE
+    country: SE
     lang: sv-SE
     currency: SEK
-    mention_on_bug: ""             # e.g. "@here" to get pinged on likely price errors
+    reference_stores:
+      - {name: GB, store: COM, country: GB, lang: en-GB, currency: GBP}
+      - {name: DE, store: DE, country: DE, lang: de-DE, currency: EUR}
+    mention_on_bug: ""             # e.g. "@here" to get pinged on every alert
     scoring:
-      deal_ratio: 0.45             # alert at <= 45% of the reference price
-      bug_ratio: 0.30              # <= 30% is flagged as a possible price error
-      min_saving: 250              # SEK below reference, filters out cheap basics
-      drop_pct: 40                 # alert when a tracked item drops >= 40% between runs
+      error_ratio: 0.5             # alert at <= 50% of the price the other stores imply
+      min_saving: 250              # SEK below the expected price, filters out cheap basics
+      min_matched: 200             # items in common needed to trust a store's price ratio
       max_alerts_per_run: 10
+      max_lookup_requests: 80      # cap on by-id reference lookups per run (first run needs ~60)
     filters:
-      # Scoring makes the blacklist optional: these brands' cheap items are normal
-      # for them and are not alerted anyway. Kept so they stay silent even on real drops.
-      exclude_brands: ["asos design", "Lost Souls", "Lost", "Jack & Jones", "Classics 77", "Topman", "COLLUSION", "JJ Rebel", "Cotton On", "Reclaimed Vintage", "Bershka", "Only & Sons"]
+      # Own-label and budget brands: not worth reselling even when mispriced.
+      exclude_brands: ["asos design", "Lost Souls", "Lost", "Jack & Jones", "Classics 77", "Topman", "COLLUSION", "JJ Rebel", "Cotton On", "Reclaimed Vintage", "Bershka", "Only & Sons", "new look", "pull&bear"]
