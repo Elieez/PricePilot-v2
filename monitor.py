@@ -11,6 +11,8 @@ STATE_DIR = ROOT / "state"
 STATE_DIR.mkdir(exist_ok=True)
 DUMP_FILE = ROOT / "scan-dump.json"  # written by --dry-run, read by --from-dump
 
+UNDELIVERED = []  # ids of alerts Discord did not accept; makes the run exit non-zero
+
 DEFAULT_REFERENCE_STORES = [
     {"name": "GB", "store": "COM", "country": "GB", "lang": "en-GB", "currency": "GBP"},
     {"name": "DE", "store": "DE", "country": "DE", "lang": "de-DE", "currency": "EUR"},
@@ -43,8 +45,34 @@ def send_discord(webhook_url: str, content: Optional[str] = None, embed: Optiona
         payload["embeds"] = [embed]
     if userName:
         payload["username"] = userName
-    r = httpx.post(webhook_url, json=payload, timeout=15)
-    return r.status_code < 300
+    # Never print the exception or the URL: the webhook URL is a secret.
+    try:
+        r = httpx.post(webhook_url, json=payload, timeout=15)
+    except Exception as e:
+        print(f"[discord] send failed: {type(e).__name__}")
+        return False
+    if r.status_code >= 300:
+        print(f"[discord] send failed: HTTP {r.status_code} {r.text[:200]}")
+        return False
+    print(f"[discord] sent: {(embed or {}).get('title', '')}")
+    return True
+
+
+def check_webhook(webhook_url: str) -> Optional[str]:
+    """Return None if Discord recognises the webhook, else what is wrong.
+    A GET on a webhook URL only describes it; nothing is posted."""
+    url = webhook_url.strip()
+    if url != webhook_url:
+        return "the value has spaces or line breaks around it"
+    if not url.startswith("https://") or "/api/webhooks/" not in url:
+        return "the value is not a Discord webhook URL (https://discord.com/api/webhooks/...)"
+    try:
+        r = httpx.get(url, timeout=15)
+    except Exception as e:
+        return f"could not reach Discord ({type(e).__name__})"
+    if r.status_code != 200:
+        return f"Discord answered HTTP {r.status_code}: the webhook was deleted or the URL is incomplete"
+    return None
 
 
 def excluded_brands(cfg: Dict, monitor: Dict) -> set:
@@ -234,10 +262,12 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
     if include_sold_out:
         for it, res in sold[:cap]:
             try:
-                send_discord(webhook, userName="PricePilot",
-                             embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"], sold_out=True))
+                ok = send_discord(webhook, userName="PricePilot",
+                                  embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"], sold_out=True))
             except Exception as e:
-                print(f"[{slug}] discord error: {e}")
+                print(f"[{slug}] discord error: {type(e).__name__}")
+                ok = False
+            UNDELIVERED.extend([] if ok else [it["id"]])
             time.sleep(0.5)
 
     for it, res in live[:cap]:
@@ -245,8 +275,9 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             ok = send_discord(webhook, content=monitor.get("mention_on_bug") or None, userName="PricePilot",
                               embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"]))
         except Exception as e:
-            print(f"[{slug}] discord error: {e}")
+            print(f"[{slug}] discord error: {type(e).__name__}")
             ok = False
+        UNDELIVERED.extend([] if ok else [it["id"]])
         # Undelivered hits (cap, webhook failure) and sold-out ones are not marked,
         # so they are tried again next run.
         if ok:
@@ -288,13 +319,22 @@ def main():
         print("DISCORD_WEBHOOK is not set; refusing to run (use --dry-run to test).")
         sys.exit(1)
 
+    if webhook:
+        problem = check_webhook(webhook)
+        if problem:
+            print(f"DISCORD_WEBHOOK is wrong: {problem}. Nothing was scanned.")
+            sys.exit(1)
+        print("Discord webhook OK.")
+
     failed = False
     for m in cfg["monitors"]:
         print(f"→ Running: {m['name']}")
         result = run_scan_monitor(cfg, m, webhook, dry_run=args.dry_run, from_dump=args.from_dump,
                                   include_sold_out=args.include_sold_out)
         failed = failed or result is None
-    sys.exit(1 if failed else 0)
+    if UNDELIVERED:
+        print(f"{len(UNDELIVERED)} alert(s) could not be delivered to Discord; they will be retried next run.")
+    sys.exit(1 if failed or UNDELIVERED else 0)
 
 
 if __name__ == "__main__":
