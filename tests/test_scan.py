@@ -71,7 +71,10 @@ class FakeAsos:
                     out.append({"productId": pid, "productPrice": {"current": {"value": r["price"][store]}},
                                 "variants": [{"isInStock": i < n} for i in range(5)]})
             return httpx.Response(200, json=out)
-        rows = [(pid, r) for pid, r in self.rows.items() if store in r["listed"]]
+        if "q" in q:  # site search by product id
+            rows = [(pid, r) for pid, r in self.rows.items() if str(pid) == q["q"] and store in r["sold"]]
+        else:
+            rows = [(pid, r) for pid, r in self.rows.items() if store in r["listed"]]
         off, lim = int(q["offset"]), int(q["limit"])
         products = [{"id": pid, "name": f"{r['brand']} item {pid}", "brandName": r["brand"],
                      "url": f"x/prd/{pid}", "imageUrl": "images.asos-media.com/x",
@@ -139,33 +142,22 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(state["refs"][str(PID["tee"])][1], {"GB": 23, "DE": 30})
         self.assertEqual(state["refs"][str(PID["se_only"])][1], {"GB": None, "DE": None})
 
-        # run 2: nothing changed -> no alert, no state write; lookups come from the cache,
-        # so only the three category scans plus one stock check for the known errors
+        # run 2: nothing changed -> no alert, no state write; lookups come from the cache and
+        # known errors need no stock check, so only the three category scans are requested
         before = self.api.calls
         self.assertFalse(self.run_once())
         self.assertEqual(self.sent, [])
         pages = lambda store: -(-sum(store in r["listed"] for r in self.api.rows.values()) // 20)
-        self.assertEqual(self.api.calls - before, pages("SE") + pages("COM") + pages("DE") + 1)
+        self.assertEqual(self.api.calls - before, pages("SE") + pages("COM") + pages("DE"))
 
-        # run 3: the sold-out error is restocked -> "back in stock" alert
+        # run 3: one alert per product, ever: a restock, a sell-out and a further price cut stay silent
         self.api.rows[PID["sold_out"]]["in_stock"] = 2
-        self.assertTrue(self.run_once())
-        self.assertEqual(self.alerted_ids(), [PID["sold_out"]])
-        self.assertIn("Back in stock", self.sent[0]["embed"]["title"])
-
-        # run 4: the Samba sells out -> silent, but remembered ...
         self.api.rows[PID["samba"]]["in_stock"] = 0
-        self.assertTrue(self.run_once())
-        self.assertEqual(self.sent, [])
-        # ... so run 5, when a size returns, alerts again; run 6 does not repeat it
-        self.api.rows[PID["samba"]]["in_stock"] = 1
-        self.assertTrue(self.run_once())
-        self.assertEqual(self.alerted_ids(), [PID["samba"]])
-        self.assertIn("Back in stock", self.sent[0]["embed"]["title"])
-        self.assertFalse(self.run_once())
+        self.api.rows[PID["unlisted"]]["price"]["SE"] = 50
+        self.run_once()
         self.assertEqual(self.sent, [])
 
-        # run 7: an item known only through a cached lookup gets a wrong price -> looked up again, alerted
+        # run 4: an item known only through a cached lookup gets a wrong price -> looked up again, alerted
         self.api.rows[PID["tee"]]["price"]["SE"] = 23
         self.api.rows[PID["tee"]]["price"]["COM"] = 60  # reference moved too: the cache must not be trusted
         self.assertTrue(self.run_once())
@@ -176,10 +168,25 @@ class ScanTest(unittest.TestCase):
         self.mon["scoring"] = {"alert_sold_out": False}
         self.run_once()
         self.assertNotIn(PID["sold_out"], self.alerted_ids())
-        self.api.rows[PID["sold_out"]]["in_stock"] = 2
+        self.api.rows[PID["sold_out"]]["in_stock"] = 2  # it waits unreported until it can be bought
         self.run_once()
         self.assertEqual(self.alerted_ids(), [PID["sold_out"]])
         self.assertIn("Possible price error", self.sent[0]["embed"]["title"])
+
+    def test_product_in_two_categories_is_scanned_and_alerted_once(self):
+        self.mon["category_ids"] = [27110, 4209]
+        self.run_once()
+        self.assertEqual(len(self.alerted_ids()), len(set(self.alerted_ids())))
+        self.assertEqual(len(self.sent), 4)
+
+    def test_watched_product_missing_from_the_category_is_still_alerted(self):
+        self.api.rows[PID["samba"]]["listed"] = set()  # ASOS dropped it from every listing
+        self.run_once()
+        self.assertNotIn(PID["samba"], self.alerted_ids())
+        self.mon["watch_ids"] = [PID["samba"], 424242]  # an unknown id is simply skipped
+        self.run_once()
+        self.assertEqual(self.alerted_ids(), [PID["samba"]])
+        self.assertIn(f"/prd/{PID['samba']}", self.sent[0]["embed"]["url"])
 
     def test_old_state_format_is_understood(self):
         self.state_file.write_text(json.dumps({"alerted": {str(PID["samba"]): [110, 20000]}, "refs": {}}))

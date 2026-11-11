@@ -95,7 +95,6 @@ def stores_text(res: Dict, cur: str, ref_cur: Dict[str, str]) -> str:
 
 EMBED_STYLE = {
     "new": ("🚨 Possible price error", 0xE53935),
-    "restock": ("🟢 Back in stock, price error", 0x43A047),
     "sold_out": ("⚫ SOLD OUT price error", 0x757575),
 }
 
@@ -168,7 +167,8 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
     ref_adapters = {r["name"]: make({**monitor, **r}, pause=pause) for r in ref_stores}
 
     state = load_state(slug)
-    # id -> [price alerted at, "in" or "out" (stock when last checked), last seen day]
+    # Products already reported; each is reported once and never again.
+    # id -> [price alerted at, "in" or "out" (stock at that moment), last seen day]
     alerted: Dict = {k: (v if len(v) == 3 else [v[0], "in", v[1]])
                      for k, v in copy.deepcopy(state.get("alerted") or {}).items()}
     # Reference prices found by id for items a reference store does not list in
@@ -191,6 +191,12 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             items = adapter.scan()
             if not items:
                 raise ValueError("scan returned no products")
+            # Products to check even when no scanned category lists them (one request each).
+            for pid in monitor.get("watch_ids") or []:
+                if pid not in items:
+                    found = adapter.find(int(pid))
+                    if found and found.get("price"):
+                        items[int(pid)] = found
             refs = {}
             budget = int(sc.get("max_lookup_requests", 80))
             for name, ra in ref_adapters.items():
@@ -218,16 +224,18 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
         ratios = scoring.store_ratios(items, refs, sc["min_matched"])
 
         skip = excluded_brands(cfg, monitor)
-        hits = []
+        hits, known = [], 0
         for pid, it in items.items():
             res = scoring.score_item(it, {n: refs[n].get(pid) for n in refs}, ratios, sc)
             if not res or (it.get("brand") or "").lower() in skip:
                 continue
+            if str(pid) in alerted:
+                known += 1  # one alert per product, ever
+                continue
             hits.append((it, res))
         hits.sort(key=lambda h: -h[1]["saving"])
 
-        # The search API has no stock data, so ask for it, but only for the hits
-        # (every run, so that selling out and restocking are noticed).
+        # The search API has no stock data, so ask for it, but only for new hits.
         if not from_dump:
             stock = adapter.stock_prices([it["id"] for it, _ in hits[:adapter.LOOKUP_BATCH]]) if hits else {}
     except Exception as e:
@@ -239,8 +247,8 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
         dumps[slug] = {"items": items, "refs": refs, "stock": stock}
         DUMP_FILE.write_text(json.dumps(dumps, ensure_ascii=False), encoding="utf-8")
 
-    # What to send: a new error (in stock or, if enabled, sold out) and a restock
-    # of a known one. An unchanged, already reported error stays silent.
+    # A new error is sent once, marked sold out if it is. With alert_sold_out off,
+    # a sold-out error waits unreported until it can be bought.
     notify_sold_out = bool(sc.get("alert_sold_out", True))
     plan, quiet = [], 0  # (item, result, kind or None, stock status)
     for it, res in hits:
@@ -249,12 +257,7 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             quiet += 1  # price already corrected
             continue
         status = "out" if s is not None and s["in_stock"] == 0 else "in"
-        last = alerted.get(str(it["id"]))
-        fresh = last is None or it["price"] <= last[0] * 0.9
-        if status == "in":
-            kind = "new" if fresh else ("restock" if last[1] == "out" else None)
-        else:
-            kind = "sold_out" if fresh and notify_sold_out else None
+        kind = "new" if status == "in" else ("sold_out" if notify_sold_out else None)
         if kind is None:
             quiet += 1
         plan.append((it, res, kind, status))
@@ -264,7 +267,7 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
     no_ref = sum(1 for pid in items if not any(refs[n].get(pid) for n in refs))
     print(f"[{slug}] {len(items)} items, {no_ref} with no reference price, {count[0]} requests; "
           + ", ".join(f"1 {ref_cur[n] or n} = {r:.2f} {monitor.get('currency', 'SEK')}" for n, r in ratios.items())
-          + f"; {len(hits)} price errors, {len(to_send)} to alert, {quiet} already reported or corrected")
+          + f"; {len(hits) + known} price errors, {len(to_send)} to alert, {known} already reported")
 
     cap = int(sc.get("max_alerts_per_run", 10))
     if dry_run:
@@ -274,11 +277,6 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             print_hit(n, it, res, stock.get(it["id"]), ref_cur)
             print(f"    alert type: {kind.replace('_', ' ')}")
         return False
-
-    # Nothing to say about these, but remember a known error selling out so its restock alerts.
-    for it, res, kind, status in plan:
-        if kind is None and str(it["id"]) in alerted:
-            alerted[str(it["id"])][1] = status
 
     # Anything over the per-run cap is left unmarked and sent next run.
     for it, res, kind, status in to_send[:cap]:
@@ -297,13 +295,13 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             UNDELIVERED.append(it["id"])
         time.sleep(0.5)
 
-    # Forget items that left the category a while ago, and lookups no longer needed.
-    keep_days = int(sc.get("keep_days", 14))
-    for store in (alerted, cache):
+    # Forget cached lookups soon after an item leaves the scan, and alerts only after
+    # a long time, so a product that drops out and returns is not reported twice.
+    for store, days in ((alerted, int(sc.get("alert_memory_days", 180))), (cache, int(sc.get("keep_days", 14)))):
         for k in list(store):
             if int(k) in items:
                 store[k][-1] = today
-            elif today - store[k][-1] > keep_days:
+            elif today - store[k][-1] > days:
                 del store[k]
 
     new_state = {"alerted": alerted, "refs": cache}

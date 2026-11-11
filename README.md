@@ -7,8 +7,8 @@ likely **price errors** to Discord. Built to send few alerts, almost all real.
 
 ASOS sells the same product, with the same product id, in every store. Each run:
 
-1. scans the whole category in the Swedish store (about 20 requests for ~4,000 items),
-2. scans the same category in the reference stores (GB and DE),
+1. scans the configured categories in the Swedish store (200 items per request),
+2. scans the same categories in the reference stores (GB and DE),
 3. looks up by id the items a reference store sells but does not list in that
    category, and caches the answer until the Swedish price changes,
 4. measures the normal SEK/GBP and SEK/EUR price ratio as the median over all
@@ -24,10 +24,12 @@ was at 0.70, so the threshold has a lot of room on both sides.
 Requiring every reference store to agree means a wrong price in one of them
 cannot cause an alert. Items no reference store sells (5 of 4,100) are not judged.
 
-Each error is reported once: red if it can be bought, grey "SOLD OUT" if not
-(turn off with `alert_sold_out: false`). When a known error comes back in stock
-a green "Back in stock" alert follows. Undelivered alerts are retried on the next
-run. A failed or partial scan sends nothing and leaves `state/` untouched.
+Each product is alerted **once, ever**: red if it can be bought, grey "SOLD OUT"
+if not (so you can set a restock reminder in the ASOS app). Later restocks or
+price changes on the same product stay silent. With `alert_sold_out: false` a
+sold-out error is held back until it can be bought. Undelivered alerts are
+retried on the next run. A failed or partial scan sends nothing and leaves
+`state/` untouched.
 
 ## Setup
 
@@ -52,8 +54,10 @@ A real local run needs `DISCORD_WEBHOOK` in the environment.
 
 ## Configuration (`config.yaml`)
 
-- `category_id`: the ASOS category to scan. Add another monitor block (with its
-  own `slug`) to scan more categories.
+- `category_ids`: the ASOS categories to scan. They are merged by product id, so
+  a product in several of them is judged and alerted once.
+- `watch_ids`: product ids (the number after `/prd/` in the URL) checked every
+  run even when no scanned category lists them.
 - `reference_stores`: stores to compare against.
 - `scoring`: `error_ratio`, `min_saving`, `max_alerts_per_run`.
 - `filters.exclude_brands`: brands never alerted.

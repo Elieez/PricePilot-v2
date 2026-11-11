@@ -19,6 +19,7 @@ class AsosApiAdapter:
     """
     BASE = "https://www.asos.com"
     SEARCH = BASE + "/api/product/search/v2/categories/{cid}"
+    SEARCH_ALL = BASE + "/api/product/search/v2/"
     STOCKPRICE = BASE + "/api/product/catalogue/v4/stockprice"
     PAGE = 200
     LOOKUP_BATCH = 50
@@ -57,10 +58,16 @@ class AsosApiAdapter:
         }
 
     def scan(self) -> Dict[int, Dict]:
-        """Return {product_id: item} for the whole category."""
-        items, offset = {}, 0
+        """Return {product_id: item} for all configured categories, merged by id."""
+        items = {}
+        for cid in self.cfg.get("category_ids") or [self.cfg["category_id"]]:
+            self._scan_category(cid, items)
+        return items
+
+    def _scan_category(self, cid: int, items: Dict[int, Dict]) -> None:
+        offset = 0
         while True:
-            data = self._get(self.SEARCH.format(cid=self.cfg["category_id"]), {
+            data = self._get(self.SEARCH.format(cid=cid), {
                 "offset": offset, "limit": self.PAGE, "sort": "freshness",
                 "store": self.store, "country": self.cfg.get("country", self.store),
                 "lang": self.cfg.get("lang", "sv-SE"), "currency": self.currency,
@@ -70,9 +77,26 @@ class AsosApiAdapter:
             for p in products:
                 items.setdefault(p["id"], self._parse(p))
             offset += len(products)
-            if not products or offset >= (data.get("itemCount") or 0):
+            if not products:
+                if offset == 0:
+                    raise ValueError(f"category {cid} returned no products in store {self.store}")
                 break
-        return items
+            if offset >= (data.get("itemCount") or 0):
+                break
+
+    def find(self, pid: int) -> Optional[Dict]:
+        """One product by id through the site search, for products ASOS no longer
+        lists in any category. None if this store does not have it."""
+        data = self._get(self.SEARCH_ALL, {
+            "q": str(pid), "offset": 0, "limit": 10,
+            "store": self.store, "country": self.cfg.get("country", self.store),
+            "lang": self.cfg.get("lang", "sv-SE"), "currency": self.currency,
+            "channel": "desktop-web",
+        })
+        for p in data.get("products") or []:
+            if p.get("id") == pid:
+                return self._parse(p)
+        return None
 
     def stock_prices(self, ids: Iterable[int]) -> Dict[int, Dict]:
         """Return {id: {"price", "in_stock", "sizes"}} for the ids this store sells.

@@ -8,13 +8,20 @@ filters:
   exclude_brands: []
 
 monitors:
-  # Scans the whole men's new-in category in the Swedish store and compares every
+  # Scans whole categories in the Swedish store and compares every
   # price with the same product in the reference stores. Alerts only when the
   # Swedish price is far below what every reference store implies.
-  - name: "ASOS (men, new in)"
+  - name: "ASOS men"
     slug: "asos-men-new"
     adapter: "asos_api"
-    category_id: 27110
+    # Scanned together and merged by product id, so a product is judged (and alerted) once.
+    category_ids:
+      - 27110   # men's new in (~4,100 items)
+      # - 4209  # men's shoes, boots & trainers (~2,850 items; doubles the requests per run)
+    # Product ids checked every run even if no category above lists them (one request each).
+    # The id is the number after /prd/ in the product URL.
+    watch_ids:
+      - 210252533   # adidas Samba, the 110 SEK error: ASOS dropped it from the category listings
     store: SE
     country: SE
     lang: sv-SE
@@ -28,8 +35,8 @@ monitors:
       min_saving: 250              # SEK below the expected price, filters out cheap basics
       min_matched: 200             # items in common needed to trust a store's price ratio
       max_alerts_per_run: 10
-      alert_sold_out: true         # also report sold-out errors once (grey); a restock alerts again (green)
-      max_lookup_requests: 80      # cap on by-id reference lookups per run (first run needs ~60)
+      alert_sold_out: true         # report sold-out errors too (grey). Either way: one alert per product, ever
+      max_lookup_requests: 120     # cap on by-id reference lookups per run (only the first run needs many)
     filters:
       # Own-label and budget brands: not worth reselling even when mispriced.
       exclude_brands: ["asos design", "Lost Souls", "Lost", "Jack & Jones", "Classics 77", "Topman", "COLLUSION", "JJ Rebel", "Cotton On", "Reclaimed Vintage", "Bershka", "Only & Sons", "new look", "pull&bear"]
