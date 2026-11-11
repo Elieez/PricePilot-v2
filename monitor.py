@@ -93,6 +93,13 @@ def stores_text(res: Dict, cur: str, ref_cur: Dict[str, str]) -> str:
     return ", ".join(f"{n}: {p:g} {ref_cur.get(n, '')} = ~{e:.0f} {cur}" for n, (p, e) in res["stores"].items())
 
 
+EMBED_STYLE = {
+    "new": ("🚨 Possible price error", 0xE53935),
+    "restock": ("🟢 Back in stock, price error", 0x43A047),
+    "sold_out": ("⚫ SOLD OUT price error", 0x757575),
+}
+
+
 def mixup_text(it: Dict, res: Dict, ref_cur: Dict[str, str]) -> str:
     """The classic error: another store's number entered as the local price."""
     same = [ref_cur.get(n) or n for n, (p, _) in res["stores"].items() if abs(p - it["price"]) < 0.5]
@@ -112,14 +119,14 @@ def print_hit(n: int, it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[
 
 
 def scan_embed(it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, str], monitor_name: str,
-               sold_out: bool = False) -> Dict:
+               kind: str = "new") -> Dict:
     cur = it.get("currency") or ""
-    label = "⚫ SOLD OUT price error" if sold_out else "🚨 Possible price error"
+    label, color = EMBED_STYLE[kind]
     mixup = mixup_text(it, res, ref_cur)
     embed = {
         "title": f"{label}: {it.get('title') or 'item'}"[:256],
         "url": it["url"],
-        "color": 0x757575 if sold_out else 0xE53935,
+        "color": color,
         "description": (
             f"**{it['price']:.0f} {cur}** vs ~{res['expected']:.0f} {cur} expected "
             f"(−{(1 - res['ratio']) * 100:.0f}%, saves {res['saving']:.0f} {cur})\n"
@@ -137,7 +144,7 @@ def scan_embed(it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, st
 # ---------------- Scan runner ----------------
 
 def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = False,
-                     from_dump: bool = False, include_sold_out: bool = False) -> Optional[bool]:
+                     from_dump: bool = False) -> Optional[bool]:
     """Returns True if state was written, False if not, None if the scan failed.
     A failed or partial scan never sends alerts and never touches state."""
     dry_run = dry_run or from_dump  # saved data may be stale: never alert from it
@@ -161,7 +168,9 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
     ref_adapters = {r["name"]: make({**monitor, **r}, pause=pause) for r in ref_stores}
 
     state = load_state(slug)
-    alerted: Dict = copy.deepcopy(state.get("alerted") or {})  # id -> [price alerted at, last seen day]
+    # id -> [price alerted at, "in" or "out" (stock when last checked), last seen day]
+    alerted: Dict = {k: (v if len(v) == 3 else [v[0], "in", v[1]])
+                     for k, v in copy.deepcopy(state.get("alerted") or {}).items()}
     # Reference prices found by id for items a reference store does not list in
     # this category: id -> [SE price when looked up, {store: price or None}, last seen day].
     # Looked up again only when the SE price changes, which is when an error can appear.
@@ -214,13 +223,11 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             res = scoring.score_item(it, {n: refs[n].get(pid) for n in refs}, ratios, sc)
             if not res or (it.get("brand") or "").lower() in skip:
                 continue
-            last = alerted.get(str(pid))
-            if last is not None and it["price"] > last[0] * 0.9:
-                continue  # already reported at (roughly) this price
             hits.append((it, res))
         hits.sort(key=lambda h: -h[1]["saving"])
 
-        # The search API has no stock data, so ask for it, but only for the hits.
+        # The search API has no stock data, so ask for it, but only for the hits
+        # (every run, so that selling out and restocking are noticed).
         if not from_dump:
             stock = adapter.stock_prices([it["id"] for it, _ in hits[:adapter.LOOKUP_BATCH]]) if hits else {}
     except Exception as e:
@@ -232,56 +239,62 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
         dumps[slug] = {"items": items, "refs": refs, "stock": stock}
         DUMP_FILE.write_text(json.dumps(dumps, ensure_ascii=False), encoding="utf-8")
 
-    live, gone, sold = [], [], []
+    # What to send: a new error (in stock or, if enabled, sold out) and a restock
+    # of a known one. An unchanged, already reported error stays silent.
+    notify_sold_out = bool(sc.get("alert_sold_out", True))
+    plan, quiet = [], 0  # (item, result, kind or None, stock status)
     for it, res in hits:
         s = stock.get(it["id"])
-        sold_out = s is not None and s["in_stock"] == 0
-        corrected = s is not None and s.get("price") and s["price"] > it["price"] * 1.01
-        (gone if sold_out or corrected else live).append((it, res))
-        if sold_out and not corrected:
-            sold.append((it, res))
+        if s is not None and s.get("price") and s["price"] > it["price"] * 1.01:
+            quiet += 1  # price already corrected
+            continue
+        status = "out" if s is not None and s["in_stock"] == 0 else "in"
+        last = alerted.get(str(it["id"]))
+        fresh = last is None or it["price"] <= last[0] * 0.9
+        if status == "in":
+            kind = "new" if fresh else ("restock" if last[1] == "out" else None)
+        else:
+            kind = "sold_out" if fresh and notify_sold_out else None
+        if kind is None:
+            quiet += 1
+        plan.append((it, res, kind, status))
+    to_send = [p for p in plan if p[2]]
+    to_send.sort(key=lambda p: p[2] == "sold_out")  # buyable ones first; stable, so biggest saving first
 
     no_ref = sum(1 for pid in items if not any(refs[n].get(pid) for n in refs))
     print(f"[{slug}] {len(items)} items, {no_ref} with no reference price, {count[0]} requests; "
           + ", ".join(f"1 {ref_cur[n] or n} = {r:.2f} {monitor.get('currency', 'SEK')}" for n, r in ratios.items())
-          + f"; {len(live)} hits, {len(gone)} sold out or already corrected")
+          + f"; {len(hits)} price errors, {len(to_send)} to alert, {quiet} already reported or corrected")
 
     cap = int(sc.get("max_alerts_per_run", 10))
     if dry_run:
-        print(f"\n{len(live)} item(s) would be alerted.")
-        for n, (it, res) in enumerate(live, 1):
+        print()
+        print(f"{len(to_send)} item(s) would be alerted.")
+        for n, (it, res, kind, _) in enumerate(to_send, 1):
             print_hit(n, it, res, stock.get(it["id"]), ref_cur)
-        if gone:
-            print(f"\n{len(gone)} more not alerted (sold out or price already corrected):")
-            for n, (it, res) in enumerate(gone, 1):
-                print_hit(n, it, res, stock.get(it["id"]), ref_cur)
+            print(f"    alert type: {kind.replace('_', ' ')}")
         return False
 
-    # Optional: also report sold-out errors (a manual run uses this to prove the
-    # whole chain works). They are not marked as alerted, so a restock still alerts.
-    if include_sold_out:
-        for it, res in sold[:cap]:
-            try:
-                ok = send_discord(webhook, userName="PricePilot",
-                                  embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"], sold_out=True))
-            except Exception as e:
-                print(f"[{slug}] discord error: {type(e).__name__}")
-                ok = False
-            UNDELIVERED.extend([] if ok else [it["id"]])
-            time.sleep(0.5)
+    # Nothing to say about these, but remember a known error selling out so its restock alerts.
+    for it, res, kind, status in plan:
+        if kind is None and str(it["id"]) in alerted:
+            alerted[str(it["id"])][1] = status
 
-    for it, res in live[:cap]:
+    # Anything over the per-run cap is left unmarked and sent next run.
+    for it, res, kind, status in to_send[:cap]:
+        key = str(it["id"])
         try:
-            ok = send_discord(webhook, content=monitor.get("mention_on_bug") or None, userName="PricePilot",
-                              embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"]))
+            ok = send_discord(webhook, userName="PricePilot",
+                              content=(monitor.get("mention_on_bug") or None) if kind != "sold_out" else None,
+                              embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"], kind))
         except Exception as e:
             print(f"[{slug}] discord error: {type(e).__name__}")
             ok = False
-        UNDELIVERED.extend([] if ok else [it["id"]])
-        # Undelivered hits (cap, webhook failure) and sold-out ones are not marked,
-        # so they are tried again next run.
+        # Undelivered alerts are not marked, so they are sent again next run.
         if ok:
-            alerted[str(it["id"])] = [it["price"], today]
+            alerted[key] = [it["price"], status, today]
+        else:
+            UNDELIVERED.append(it["id"])
         time.sleep(0.5)
 
     # Forget items that left the category a while ago, and lookups no longer needed.
@@ -307,8 +320,6 @@ def main():
                     help="scan and print what would be alerted; send nothing, change no state")
     ap.add_argument("--from-dump", action="store_true",
                     help="like --dry-run, but re-score the data saved by the last dry run (no requests)")
-    ap.add_argument("--include-sold-out", action="store_true",
-                    help="also send sold-out price errors, marked as such (they stay eligible for a restock alert)")
     args = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")  # Windows consoles choke on some product names
@@ -329,8 +340,7 @@ def main():
     failed = False
     for m in cfg["monitors"]:
         print(f"→ Running: {m['name']}")
-        result = run_scan_monitor(cfg, m, webhook, dry_run=args.dry_run, from_dump=args.from_dump,
-                                  include_sold_out=args.include_sold_out)
+        result = run_scan_monitor(cfg, m, webhook, dry_run=args.dry_run, from_dump=args.from_dump)
         failed = failed or result is None
     if UNDELIVERED:
         print(f"{len(UNDELIVERED)} alert(s) could not be delivered to Discord; they will be retried next run.")

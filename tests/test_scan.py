@@ -123,57 +123,75 @@ class ScanTest(unittest.TestCase):
         self.assertFalse(self.run_once(from_dump=True))
         self.assertEqual(self.api.calls, before)
 
-        # run 1: the three in-stock price errors, biggest saving first; none of the old false alerts
+        # run 1: the three in-stock price errors (biggest saving first), then the sold-out
+        # one marked as such; none of the old false alerts
         self.assertTrue(self.run_once())
-        self.assertEqual(self.alerted_ids(), [PID["unlisted"], PID["one_store"], PID["samba"]])
+        self.assertEqual(self.alerted_ids(), [PID["unlisted"], PID["one_store"], PID["samba"], PID["sold_out"]])
         samba = self.sent[2]["embed"]
         self.assertIn("Possible price error", samba["title"])
         self.assertTrue(samba["url"].startswith("https://www.asos.com/se/"))
         self.assertIn("1 of 5 sizes in stock", samba["description"])
         self.assertIn("GB: 110 GBP", samba["description"])
+        self.assertIn("currency mix-up", samba["description"])
+        self.assertIn("SOLD OUT", self.sent[3]["embed"]["title"])
         state = json.loads(self.state_file.read_text())
-        self.assertEqual(set(state["alerted"]), {str(PID[n]) for n in ("samba", "unlisted", "one_store")})
+        self.assertEqual(set(state["alerted"]), {str(PID[n]) for n in ("samba", "unlisted", "one_store", "sold_out")})
         self.assertEqual(state["refs"][str(PID["tee"])][1], {"GB": 23, "DE": 30})
         self.assertEqual(state["refs"][str(PID["se_only"])][1], {"GB": None, "DE": None})
 
         # run 2: nothing changed -> no alert, no state write; lookups come from the cache,
-        # so only the three category scans plus the stock check for the sold-out hit
+        # so only the three category scans plus one stock check for the known errors
         before = self.api.calls
         self.assertFalse(self.run_once())
         self.assertEqual(self.sent, [])
         pages = lambda store: -(-sum(store in r["listed"] for r in self.api.rows.values()) // 20)
         self.assertEqual(self.api.calls - before, pages("SE") + pages("COM") + pages("DE") + 1)
 
-        # run 3: the sold-out error is restocked -> alerted now
+        # run 3: the sold-out error is restocked -> "back in stock" alert
         self.api.rows[PID["sold_out"]]["in_stock"] = 2
         self.assertTrue(self.run_once())
         self.assertEqual(self.alerted_ids(), [PID["sold_out"]])
+        self.assertIn("Back in stock", self.sent[0]["embed"]["title"])
 
-        # run 4: an item known only through a cached lookup gets a wrong price -> looked up again, alerted
+        # run 4: the Samba sells out -> silent, but remembered ...
+        self.api.rows[PID["samba"]]["in_stock"] = 0
+        self.assertTrue(self.run_once())
+        self.assertEqual(self.sent, [])
+        # ... so run 5, when a size returns, alerts again; run 6 does not repeat it
+        self.api.rows[PID["samba"]]["in_stock"] = 1
+        self.assertTrue(self.run_once())
+        self.assertEqual(self.alerted_ids(), [PID["samba"]])
+        self.assertIn("Back in stock", self.sent[0]["embed"]["title"])
+        self.assertFalse(self.run_once())
+        self.assertEqual(self.sent, [])
+
+        # run 7: an item known only through a cached lookup gets a wrong price -> looked up again, alerted
         self.api.rows[PID["tee"]]["price"]["SE"] = 23
         self.api.rows[PID["tee"]]["price"]["COM"] = 60  # reference moved too: the cache must not be trusted
         self.assertTrue(self.run_once())
         self.assertEqual(self.alerted_ids(), [PID["tee"]])
         self.assertIn("GB: 60 GBP", self.sent[0]["embed"]["description"])
 
-        # run 5: same prices -> not repeated
-        self.assertFalse(self.run_once())
-        self.assertEqual(self.sent, [])
+    def test_sold_out_alerts_can_be_turned_off(self):
+        self.mon["scoring"] = {"alert_sold_out": False}
+        self.run_once()
+        self.assertNotIn(PID["sold_out"], self.alerted_ids())
+        self.api.rows[PID["sold_out"]]["in_stock"] = 2
+        self.run_once()
+        self.assertEqual(self.alerted_ids(), [PID["sold_out"]])
+        self.assertIn("Possible price error", self.sent[0]["embed"]["title"])
 
-    def test_include_sold_out_sends_it_marked_and_keeps_it_retryable(self):
-        self.run_once(include_sold_out=True)
-        titles = {i: m["embed"]["title"] for i, m in zip(self.alerted_ids(), self.sent)}
-        self.assertEqual(len(titles), 4)
-        self.assertIn("SOLD OUT", titles[PID["sold_out"]])
-        self.assertIn("currency mix-up", self.sent[0]["embed"]["description"])
-        self.assertNotIn(str(PID["sold_out"]), json.loads(self.state_file.read_text())["alerted"])
+    def test_old_state_format_is_understood(self):
+        self.state_file.write_text(json.dumps({"alerted": {str(PID["samba"]): [110, 20000]}, "refs": {}}))
+        self.run_once()
+        self.assertNotIn(PID["samba"], self.alerted_ids())
 
     def test_undelivered_alert_is_retried(self):
         monitor.send_discord = lambda webhook, **kw: False
         self.run_once()
         monitor.send_discord = lambda webhook, **kw: self.sent.append(kw) or True
         self.run_once()
-        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(len(self.sent), 4)
 
     def check_failure_changes_nothing(self, fail):
         self.assertTrue(self.run_once())

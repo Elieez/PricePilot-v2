@@ -15,7 +15,7 @@ ASOS sells the same product, with the same product id, in every store. Each run:
    items in the run (no FX API involved),
 5. flags items whose Swedish price is at most `error_ratio` (50%) of what
    **every** reference store implies and at least `min_saving` SEK below it,
-6. checks stock for the flagged items only, and drops the sold-out ones.
+6. checks stock for the flagged items only.
 
 Real example: a Samba at 110 GBP in the UK was listed at 110 SEK in Sweden,
 0.07 of the expected ratio. The lowest normally priced item in the same scan
@@ -24,9 +24,10 @@ was at 0.70, so the threshold has a lot of room on both sides.
 Requiring every reference store to agree means a wrong price in one of them
 cannot cause an alert. Items no reference store sells (5 of 4,100) are not judged.
 
-Sold-out and undelivered alerts are not marked as sent, so they are retried on
-later runs (a restock alerts). A failed or partial scan sends nothing and
-leaves `state/` untouched.
+Each error is reported once: red if it can be bought, grey "SOLD OUT" if not
+(turn off with `alert_sold_out: false`). When a known error comes back in stock
+a green "Back in stock" alert follows. Undelivered alerts are retried on the next
+run. A failed or partial scan sends nothing and leaves `state/` untouched.
 
 ## Setup
 

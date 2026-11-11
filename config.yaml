@@ -28,6 +28,7 @@ monitors:
       min_saving: 250              # SEK below the expected price, filters out cheap basics
       min_matched: 200             # items in common needed to trust a store's price ratio
       max_alerts_per_run: 10
+      alert_sold_out: true         # also report sold-out errors once (grey); a restock alerts again (green)
       max_lookup_requests: 80      # cap on by-id reference lookups per run (first run needs ~60)
     filters:
       # Own-label and budget brands: not worth reselling even when mispriced.
