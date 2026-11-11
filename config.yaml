@@ -1,0 +1,43 @@
+discord_webhook: "${{ secrets.DISCORD_WEBHOOK }}"
+
+# Default output currency
+currency_output: SEK
+fx:
+  provider: exchangerate_host
+  refresh_hours: 24
+  symbols: [SEK, EUR, USD, GBP, DKK, NOK]
+
+run:
+  sample_limit_per_run: 30
+  jitter_ms: [800, 1600]
+
+#Global filters (can overrider per monitor)
+filters:
+  include_brands: []
+  exclude_brands: ["new look", "pull&bear"]
+  require_discount_pct: 0
+  unique_by: "variant"
+  keep_query_params: ["colourWayId","clr"]
+
+monitors:
+  # Scans the whole men's new-in category through the ASOS search API and alerts
+  # only on items priced far below what that brand + product type normally costs.
+  - name: "ASOS (men, new in)"
+    slug: "asos-men-new"
+    adapter: "asos_api"
+    category_id: 27110
+    type_facet: "attribute_1047"   # "Produkttyp"
+    store: SE
+    lang: sv-SE
+    currency: SEK
+    mention_on_bug: ""             # e.g. "@here" to get pinged on likely price errors
+    scoring:
+      deal_ratio: 0.45             # alert at <= 45% of the reference price
+      bug_ratio: 0.30              # <= 30% is flagged as a possible price error
+      min_saving: 250              # SEK below reference, filters out cheap basics
+      drop_pct: 40                 # alert when a tracked item drops >= 40% between runs
+      max_alerts_per_run: 10
+    filters:
+      # Scoring makes the blacklist optional: these brands' cheap items are normal
+      # for them and are not alerted anyway. Kept so they stay silent even on real drops.
+      exclude_brands: ["asos design", "Lost Souls", "Lost", "Jack & Jones", "Classics 77", "Topman", "COLLUSION", "JJ Rebel", "Cotton On", "Reclaimed Vintage", "Bershka", "Only & Sons"]
