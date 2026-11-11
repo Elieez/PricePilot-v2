@@ -3,7 +3,12 @@ name: PricePilot Monitor
 on:
   schedule:
     - cron: "7 * * * *" # hourly, off the top of the hour (GitHub delays :00 jobs the most)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      include_sold_out:
+        description: "Also send sold-out price errors (use to test the Discord alert)"
+        type: boolean
+        default: false
 
 # Never two scans at once: they would double the request rate and race on state.
 concurrency:
@@ -34,7 +39,7 @@ jobs:
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python monitor.py
+        run: python monitor.py ${{ inputs.include_sold_out && '--include-sold-out' || '' }}
 
       - name: Commit state changes
         run: |

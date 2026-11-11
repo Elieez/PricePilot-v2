@@ -65,6 +65,12 @@ def stores_text(res: Dict, cur: str, ref_cur: Dict[str, str]) -> str:
     return ", ".join(f"{n}: {p:g} {ref_cur.get(n, '')} = ~{e:.0f} {cur}" for n, (p, e) in res["stores"].items())
 
 
+def mixup_text(it: Dict, res: Dict, ref_cur: Dict[str, str]) -> str:
+    """The classic error: another store's number entered as the local price."""
+    same = [ref_cur.get(n) or n for n, (p, _) in res["stores"].items() if abs(p - it["price"]) < 0.5]
+    return f"Same number as the {'/'.join(same)} price: looks like a currency mix-up" if same else ""
+
+
 def print_hit(n: int, it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, str]):
     cur = it.get("currency") or ""
     print(f"\n#{n}  {it.get('title')}")
@@ -72,20 +78,26 @@ def print_hit(n: int, it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[
           f"({(1 - res['ratio']) * 100:.0f}% below, saves {res['saving']:.0f} {cur})")
     print(f"    {it.get('brand')}  -  {stores_text(res, cur, ref_cur)}")
     print(f"    {stock_text(stock)}")
+    if mixup_text(it, res, ref_cur):
+        print(f"    {mixup_text(it, res, ref_cur)}")
     print(f"    {it['url']}")
 
 
-def scan_embed(it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, str], monitor_name: str) -> Dict:
+def scan_embed(it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, str], monitor_name: str,
+               sold_out: bool = False) -> Dict:
     cur = it.get("currency") or ""
+    label = "⚫ SOLD OUT price error" if sold_out else "🚨 Possible price error"
+    mixup = mixup_text(it, res, ref_cur)
     embed = {
-        "title": f"🚨 Possible price error: {it.get('title') or 'item'}"[:256],
+        "title": f"{label}: {it.get('title') or 'item'}"[:256],
         "url": it["url"],
-        "color": 0xE53935,
+        "color": 0x757575 if sold_out else 0xE53935,
         "description": (
             f"**{it['price']:.0f} {cur}** vs ~{res['expected']:.0f} {cur} expected "
             f"(−{(1 - res['ratio']) * 100:.0f}%, saves {res['saving']:.0f} {cur})\n"
             f"{it.get('brand') or 'Unknown brand'} • {stock_text(stock)}\n"
             f"Other stores: {stores_text(res, cur, ref_cur)}"
+            + ("\n" + mixup if mixup else "")
         ),
         "footer": {"text": monitor_name},
     }
@@ -97,7 +109,7 @@ def scan_embed(it: Dict, res: Dict, stock: Optional[Dict], ref_cur: Dict[str, st
 # ---------------- Scan runner ----------------
 
 def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = False,
-                     from_dump: bool = False) -> Optional[bool]:
+                     from_dump: bool = False, include_sold_out: bool = False) -> Optional[bool]:
     """Returns True if state was written, False if not, None if the scan failed.
     A failed or partial scan never sends alerts and never touches state."""
     dry_run = dry_run or from_dump  # saved data may be stale: never alert from it
@@ -192,12 +204,14 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
         dumps[slug] = {"items": items, "refs": refs, "stock": stock}
         DUMP_FILE.write_text(json.dumps(dumps, ensure_ascii=False), encoding="utf-8")
 
-    live, gone = [], []
+    live, gone, sold = [], [], []
     for it, res in hits:
         s = stock.get(it["id"])
         sold_out = s is not None and s["in_stock"] == 0
         corrected = s is not None and s.get("price") and s["price"] > it["price"] * 1.01
         (gone if sold_out or corrected else live).append((it, res))
+        if sold_out and not corrected:
+            sold.append((it, res))
 
     no_ref = sum(1 for pid in items if not any(refs[n].get(pid) for n in refs))
     print(f"[{slug}] {len(items)} items, {no_ref} with no reference price, {count[0]} requests; "
@@ -214,6 +228,17 @@ def run_scan_monitor(cfg: Dict, monitor: Dict, webhook: str, dry_run: bool = Fal
             for n, (it, res) in enumerate(gone, 1):
                 print_hit(n, it, res, stock.get(it["id"]), ref_cur)
         return False
+
+    # Optional: also report sold-out errors (a manual run uses this to prove the
+    # whole chain works). They are not marked as alerted, so a restock still alerts.
+    if include_sold_out:
+        for it, res in sold[:cap]:
+            try:
+                send_discord(webhook, userName="PricePilot",
+                             embed=scan_embed(it, res, stock.get(it["id"]), ref_cur, monitor["name"], sold_out=True))
+            except Exception as e:
+                print(f"[{slug}] discord error: {e}")
+            time.sleep(0.5)
 
     for it, res in live[:cap]:
         try:
@@ -251,6 +276,8 @@ def main():
                     help="scan and print what would be alerted; send nothing, change no state")
     ap.add_argument("--from-dump", action="store_true",
                     help="like --dry-run, but re-score the data saved by the last dry run (no requests)")
+    ap.add_argument("--include-sold-out", action="store_true",
+                    help="also send sold-out price errors, marked as such (they stay eligible for a restock alert)")
     args = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")  # Windows consoles choke on some product names
@@ -264,7 +291,8 @@ def main():
     failed = False
     for m in cfg["monitors"]:
         print(f"→ Running: {m['name']}")
-        result = run_scan_monitor(cfg, m, webhook, dry_run=args.dry_run, from_dump=args.from_dump)
+        result = run_scan_monitor(cfg, m, webhook, dry_run=args.dry_run, from_dump=args.from_dump,
+                                  include_sold_out=args.include_sold_out)
         failed = failed or result is None
     sys.exit(1 if failed else 0)
 

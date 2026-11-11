@@ -160,6 +160,14 @@ class ScanTest(unittest.TestCase):
         self.assertFalse(self.run_once())
         self.assertEqual(self.sent, [])
 
+    def test_include_sold_out_sends_it_marked_and_keeps_it_retryable(self):
+        self.run_once(include_sold_out=True)
+        titles = {i: m["embed"]["title"] for i, m in zip(self.alerted_ids(), self.sent)}
+        self.assertEqual(len(titles), 4)
+        self.assertIn("SOLD OUT", titles[PID["sold_out"]])
+        self.assertIn("currency mix-up", self.sent[0]["embed"]["description"])
+        self.assertNotIn(str(PID["sold_out"]), json.loads(self.state_file.read_text())["alerted"])
+
     def test_undelivered_alert_is_retried(self):
         monitor.send_discord = lambda webhook, **kw: False
         self.run_once()
