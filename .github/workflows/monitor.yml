@@ -29,19 +29,6 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # TEMPORARY: proves the webhook delivers. Manual runs only. Remove once confirmed.
-      - name: Send Discord test message
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          python - <<'EOF'
-          import os, sys, monitor
-          ok = monitor.send_discord(os.environ["DISCORD_WEBHOOK"], userName="PricePilot",
-                                    content="PricePilot test message: the webhook works. Price-error alerts will appear in this channel.")
-          sys.exit(0 if ok else 1)
-          EOF
-
       # Exits non-zero when the scan failed or was blocked, which fails the job
       # (so it shows red and GitHub notifies you) and skips the state commit.
       - name: Run monitor
