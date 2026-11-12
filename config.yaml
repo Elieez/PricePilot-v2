@@ -20,8 +20,7 @@ monitors:
       # - 4209  # men's shoes, boots & trainers (~2,850 items; doubles the requests per run)
     # Product ids checked every run even if no category above lists them (one request each).
     # The id is the number after /prd/ in the product URL.
-    watch_ids:
-      - 210252533   # adidas Samba, the 110 SEK error: ASOS dropped it from the category listings
+    watch_ids: []
     store: SE
     country: SE
     lang: sv-SE
